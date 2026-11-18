@@ -1,0 +1,37 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Environment variables
+.env
+
+# PyCharm
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+
+# Ignore data files
+*.csv
+*.xlsx
+*.parquet
+*.zip
+
+
+/codes/data_fetch.py
+/codes/data_value_verification.py
+/data issues check/main_table_mismatch/.ipynb_checkpoints/Untitled-checkpoint.ipynb
+/data issues check/main_table_mismatch/Untitled.ipynb
