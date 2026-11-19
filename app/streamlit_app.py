@@ -167,6 +167,12 @@ def run_query(query_id, statement):
             con.close()
 
 
+def clear_result_filters(query_id, columns):
+    st.session_state[f"filter_columns_{query_id}"] = []
+    for column in columns:
+        st.session_state[f"filter_value_{query_id}_{column}"] = ""
+
+
 st.sidebar.markdown("## ◈ Data catalog")
 st.sidebar.caption("Browse tables and find column names")
 search = st.sidebar.text_input("Search columns", placeholder="e.g. family_id, date, status")
@@ -277,13 +283,45 @@ for query_id, query_tab in zip(st.session_state.query_ids, query_tabs):
             else:
                 result = query_output["data"]
                 st.caption(f"Output from: `{query_output['statement'][:180]}`")
+                with st.expander("Filter results by column", expanded=False):
+                    selected_filter_columns = st.multiselect(
+                        "Choose columns to filter",
+                        options=list(result.columns),
+                        key=f"filter_columns_{query_id}",
+                        placeholder="Select one or more result columns",
+                    )
+                    filter_values = {}
+                    filter_columns = st.columns(2)
+                    for index, column in enumerate(selected_filter_columns):
+                        with filter_columns[index % len(filter_columns)]:
+                            filter_values[column] = st.text_input(
+                                f"{column} contains",
+                                key=f"filter_value_{query_id}_{column}",
+                                placeholder="Type a value to match",
+                            )
+                    st.caption("Matches are case-insensitive; filters across columns are combined.")
+                    st.button(
+                        "Clear filters",
+                        key=f"clear_filters_{query_id}",
+                        on_click=clear_result_filters,
+                        args=(query_id, list(result.columns)),
+                    )
+
+                filtered_result = result
+                for column, value in filter_values.items():
+                    if value.strip():
+                        matches = filtered_result[column].astype("string").str.contains(
+                            re.escape(value.strip()), case=False, na=False
+                        )
+                        filtered_result = filtered_result[matches]
+
                 metric1, metric2 = st.columns(2)
-                metric1.metric("Rows returned", f"{len(result):,}")
-                metric2.metric("Columns returned", f"{len(result.columns):,}")
-                st.dataframe(result, use_container_width=True, height=480)
+                metric1.metric("Rows shown", f"{len(filtered_result):,} / {len(result):,}")
+                metric2.metric("Columns returned", f"{len(filtered_result.columns):,}")
+                st.dataframe(filtered_result, use_container_width=True, height=480)
                 st.download_button(
-                    "Download results as CSV",
-                    data=result.to_csv(index=False).encode("utf-8"),
+                    "Download filtered results as CSV",
+                    data=filtered_result.to_csv(index=False).encode("utf-8"),
                     file_name=f"query_{query_id}_results.csv",
                     mime="text/csv",
                     key=f"download_query_{query_id}",
