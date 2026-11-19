@@ -187,6 +187,11 @@ def run_query(query_id, statement):
         con = connect()
         result = con.execute(statement)
         if result.description:
+            st.session_state[f"result_filters_{query_id}"] = []
+            st.session_state[f"filter_logic_{query_id}"] = "AND"
+            st.session_state[f"filter_version_{query_id}"] = (
+                st.session_state.get(f"filter_version_{query_id}", 0) + 1
+            )
             st.session_state[f"query_result_{query_id}"] = {
                 "data": result.df(),
                 "statement": statement,
@@ -210,10 +215,56 @@ def run_query(query_id, statement):
             con.close()
 
 
-def clear_result_filters(query_id, columns):
-    st.session_state[f"filter_columns_{query_id}"] = []
-    for column in columns:
-        st.session_state[f"filter_value_{query_id}_{column}"] = ""
+def clear_result_filters(query_id):
+    st.session_state[f"result_filters_{query_id}"] = []
+    st.session_state[f"filter_logic_{query_id}"] = "AND"
+
+
+def remove_filter_rule(query_id, rule_index):
+    rules = list(st.session_state.get(f"result_filters_{query_id}", []))
+    if 0 <= rule_index < len(rules):
+        rules.pop(rule_index)
+    st.session_state[f"result_filters_{query_id}"] = rules
+
+
+def apply_result_filters(result, rules, logic):
+    """Apply selected output filters and combine rules with AND or OR."""
+    masks = []
+    for rule in rules:
+        series = result[rule["column"]]
+        operator = rule["operator"]
+        values = rule["values"]
+
+        if operator == "IN":
+            mask = series.notna() & series.isin(values)
+        elif operator == "NOT IN":
+            mask = series.notna() & ~series.isin(values)
+        elif operator == "=":
+            mask = series.notna() & series.eq(values[0])
+        elif operator == "!=":
+            mask = series.notna() & series.ne(values[0])
+        elif operator == "contains":
+            mask = series.astype("string").str.contains(
+                re.escape(str(values[0])), case=False, na=False
+            )
+        elif operator == "not contains":
+            mask = series.astype("string").str.contains(
+                re.escape(str(values[0])), case=False, na=False
+            )
+            mask = ~mask
+        elif operator == "is null":
+            mask = series.isna()
+        else:  # is not null
+            mask = series.notna()
+        masks.append(mask)
+
+    if not masks:
+        return result
+
+    combined = masks[0].copy()
+    for mask in masks[1:]:
+        combined = combined & mask if logic == "AND" else combined | mask
+    return result[combined]
 
 
 st.sidebar.markdown("## ◈ Data catalog")
@@ -330,37 +381,108 @@ for query_id, query_tab in zip(st.session_state.query_ids, query_tabs):
             else:
                 result = query_output["data"]
                 st.caption(f"Output from: `{query_output['statement'][:180]}`")
+                filter_version = st.session_state.get(f"filter_version_{query_id}", 0)
                 with st.expander("Filter results by column", expanded=False):
-                    selected_filter_columns = st.multiselect(
-                        "Choose columns to filter",
-                        options=list(result.columns),
-                        key=f"filter_columns_{query_id}",
-                        placeholder="Select one or more result columns",
-                    )
-                    filter_values = {}
-                    filter_columns = st.columns(2)
-                    for index, column in enumerate(selected_filter_columns):
-                        with filter_columns[index % len(filter_columns)]:
-                            filter_values[column] = st.text_input(
-                                f"{column} contains",
-                                key=f"filter_value_{query_id}_{column}",
-                                placeholder="Type a value to match",
-                            )
-                    st.caption("Matches are case-insensitive; filters across columns are combined.")
+                    st.caption("Choose a result column, then select one or more of its values.")
+                    filter_controls = st.columns([1.5, 1, 2.5])
+                    with filter_controls[0]:
+                        filter_column = st.selectbox(
+                            "Column",
+                            options=list(result.columns),
+                            key=f"filter_column_{query_id}_{filter_version}",
+                        )
+                    with filter_controls[1]:
+                        filter_operator = st.selectbox(
+                            "Condition",
+                            options=["IN", "NOT IN", "=", "!=", "contains", "not contains", "is null", "is not null"],
+                            key=f"filter_operator_{query_id}_{filter_version}",
+                        )
+
+                    available_values = result[filter_column].dropna().drop_duplicates().tolist()
+                    max_filter_values = 2000
+                    values_limited = len(available_values) > max_filter_values
+                    if values_limited:
+                        available_values = available_values[:max_filter_values]
+
+                    new_filter_values = []
+                    if filter_operator in ("IN", "NOT IN"):
+                        new_filter_values = st.multiselect(
+                            "Values",
+                            options=available_values,
+                            key=f"filter_values_{query_id}_{filter_version}_{filter_column}",
+                            placeholder="Search and select one or more values",
+                        )
+                    elif filter_operator in ("=", "!="):
+                        chosen_value = st.selectbox(
+                            "Value",
+                            options=available_values,
+                            index=None,
+                            key=f"filter_value_{query_id}_{filter_version}_{filter_column}",
+                            placeholder="Choose a value",
+                        )
+                        if chosen_value is not None:
+                            new_filter_values = [chosen_value]
+                    elif filter_operator in ("contains", "not contains"):
+                        contains_value = st.text_input(
+                            "Value contains",
+                            key=f"filter_contains_{query_id}_{filter_version}_{filter_column}",
+                            placeholder="Type text to match",
+                        )
+                        if contains_value:
+                            new_filter_values = [contains_value]
+
+                    if values_limited:
+                        st.caption(f"Showing the first {max_filter_values:,} distinct values. Type in the selector to search them.")
+
+                    if st.button(
+                        "＋ Add filter",
+                        key=f"add_filter_{query_id}",
+                        disabled=(filter_operator in ("IN", "NOT IN", "=", "!=", "contains", "not contains") and not new_filter_values),
+                    ):
+                        rules_key = f"result_filters_{query_id}"
+                        rules = list(st.session_state.get(rules_key, []))
+                        rules.append({
+                            "column": filter_column,
+                            "operator": filter_operator,
+                            "values": new_filter_values,
+                        })
+                        st.session_state[rules_key] = rules
+
+                    rules_key = f"result_filters_{query_id}"
+                    rules = st.session_state.get(rules_key, [])
+                    if len(rules) > 1:
+                        st.radio(
+                            "Combine filters",
+                            options=["AND", "OR"],
+                            horizontal=True,
+                            key=f"filter_logic_{query_id}",
+                            help="AND requires every rule to match. OR requires at least one rule to match.",
+                        )
+                    else:
+                        st.session_state.setdefault(f"filter_logic_{query_id}", "AND")
+
+                    for rule_index, rule in enumerate(rules):
+                        rule_values = ", ".join(str(value) for value in rule["values"])
+                        rule_label = f"{rule['column']} {rule['operator']} {rule_values}".strip()
+                        rule_row = st.columns([5, 1])
+                        rule_row[0].code(rule_label)
+                        rule_row[1].button(
+                            "Remove",
+                            key=f"remove_filter_{query_id}_{rule_index}",
+                            on_click=remove_filter_rule,
+                            args=(query_id, rule_index),
+                        )
+
                     st.button(
                         "Clear filters",
                         key=f"clear_filters_{query_id}",
                         on_click=clear_result_filters,
-                        args=(query_id, list(result.columns)),
+                        args=(query_id,),
                     )
 
-                filtered_result = result
-                for column, value in filter_values.items():
-                    if value.strip():
-                        matches = filtered_result[column].astype("string").str.contains(
-                            re.escape(value.strip()), case=False, na=False
-                        )
-                        filtered_result = filtered_result[matches]
+                active_rules = st.session_state.get(f"result_filters_{query_id}", [])
+                filter_logic = st.session_state.get(f"filter_logic_{query_id}", "AND")
+                filtered_result = apply_result_filters(result, active_rules, filter_logic)
 
                 metric1, metric2 = st.columns(2)
                 metric1.metric("Rows shown", f"{len(filtered_result):,} / {len(result):,}")
