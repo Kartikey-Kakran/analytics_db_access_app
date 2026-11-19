@@ -3,6 +3,7 @@ import re
 import streamlit as st
 
 from app.db import TABLE_FILES, TABLE_GROUPS, connect
+from app.sql_editor import sql_editor
 
 
 st.set_page_config(
@@ -58,30 +59,80 @@ def get_catalog():
 
 
 def apply_suggestion(query_key, query_text, suggestion):
-    """Replace the unfinished token at the end of the query with a suggestion."""
-    query_text = re.sub(r"[A-Za-z_][A-Za-z0-9_$]*$", "", query_text)
-    st.session_state[query_key] = query_text + suggestion
+    """Replace the current unfinished token, preserving a trailing semicolon."""
+    suffix_match = re.search(r";?\s*$", query_text)
+    suffix = suffix_match.group(0) if suffix_match else ""
+    prefix = query_text[: suffix_match.start()] if suffix_match else query_text
+    prefix = re.sub(r"[A-Za-z_][A-Za-z0-9_$]*$", "", prefix)
+    st.session_state[query_key] = prefix + suggestion + suffix
 
 
 def get_suggestions(query_text, schema):
-    """Return table completions after FROM/JOIN, otherwise matching columns."""
-    table_match = re.search(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_$]*)?$", query_text, re.IGNORECASE)
-    token_match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)$", query_text)
+    """Suggest table names and schema columns from the active SQL context."""
+    # Ignore a trailing semicolon while interpreting an unfinished final clause.
+    active_sql = query_text.rstrip()
+    if active_sql.endswith(";"):
+        active_sql = active_sql[:-1].rstrip()
+    if not active_sql:
+        return None, []
 
+    table_match = re.search(
+        r"\b(?:FROM|JOIN)(?:\s+([A-Za-z_][A-Za-z0-9_$]*))?\s*$",
+        active_sql,
+        re.IGNORECASE,
+    )
     if table_match:
         prefix = table_match.group(1) or ""
         candidates = list(TABLE_FILES)
         kind = "table"
     else:
-        prefix = token_match.group(1) if token_match else ""
-        # Only display column candidates once the user begins typing a name.
-        if not prefix:
-            return "column", []
-        candidates = sorted({column for columns in schema.values() for column, _ in columns})
-        kind = "column"
+        # Build the referenced table and alias map for more relevant columns.
+        table_aliases = {}
+        reserved = {"WHERE", "JOIN", "ON", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "GROUP", "ORDER", "LIMIT", "UNION"}
+        relation_pattern = re.compile(
+            r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_$]*))?",
+            re.IGNORECASE,
+        )
+        for relation in relation_pattern.finditer(active_sql):
+            table_name, alias = relation.group(1), relation.group(2)
+            if table_name in schema:
+                table_aliases[table_name.casefold()] = table_name
+                if alias and alias.upper() not in reserved:
+                    table_aliases[alias.casefold()] = table_name
+
+        qualified_match = re.search(
+            r"([A-Za-z_][A-Za-z0-9_$]*)\.([A-Za-z_][A-Za-z0-9_$]*)?$",
+            active_sql,
+        )
+        token_match = re.search(r"([A-Za-z_][A-Za-z0-9_$]*)$", active_sql)
+        clause_match = re.search(
+            r"(?:\bSELECT|\bWHERE|\bAND|\bOR|\bON|\bBY|,)\s*$",
+            active_sql,
+            re.IGNORECASE,
+        )
+
+        if qualified_match:
+            qualifier = qualified_match.group(1).casefold()
+            prefix = qualified_match.group(2) or ""
+            source_table = table_aliases.get(qualifier)
+            source_tables = [source_table] if source_table else list(schema)
+            candidates = sorted({column for table in source_tables for column, _ in schema[table]})
+            kind = "column"
+        elif token_match:
+            prefix = token_match.group(1)
+            source_tables = list(dict.fromkeys(table_aliases.values())) or list(schema)
+            candidates = sorted({column for table in source_tables for column, _ in schema[table]})
+            kind = "column"
+        elif clause_match:
+            prefix = ""
+            source_tables = list(dict.fromkeys(table_aliases.values())) or list(schema)
+            candidates = sorted({column for table in source_tables for column, _ in schema[table]})
+            kind = "column"
+        else:
+            return None, []
 
     matches = [name for name in candidates if name.casefold().startswith(prefix.casefold())]
-    return kind, matches[:16]
+    return kind, matches[:20]
 
 
 def split_sql_statements(sql_text):
@@ -226,12 +277,19 @@ query_tabs = st.tabs([f"Query {query_id}" for query_id in st.session_state.query
 for query_id, query_tab in zip(st.session_state.query_ids, query_tabs):
     with query_tab:
         sql_key = f"query_sql_{query_id}"
-        sql = st.text_area(
-            "SQL",
-            height=230,
-            label_visibility="collapsed",
+        st.caption("SQL keywords · purple    Tables · orange    Columns · blue")
+        sql = sql_editor(
+            value=st.session_state.get(sql_key, ""),
+            tables=list(TABLE_FILES),
+            columns={
+                table_name: [column for column, _ in table_columns]
+                for table_name, table_columns in catalog.items()
+            },
+            height=300,
             key=sql_key,
         )
+        if sql is None:
+            sql = st.session_state.get(sql_key, "")
         statements = split_sql_statements(sql)
 
         if len(statements) > 1:
@@ -252,18 +310,21 @@ for query_id, query_tab in zip(st.session_state.query_ids, query_tabs):
             chosen_statement = ""
 
         suggestion_kind, suggestions = get_suggestions(sql, catalog)
-        if suggestions:
+        if suggestion_kind:
             st.caption(f"Suggestions · {suggestion_kind}s · select one to insert")
-            suggestion_columns = st.columns(min(4, len(suggestions)))
-            for index, suggestion in enumerate(suggestions):
-                with suggestion_columns[index % len(suggestion_columns)]:
-                    st.button(
-                        suggestion,
-                        key=f"completion_{query_id}_{suggestion_kind}_{index}_{suggestion}",
-                        on_click=apply_suggestion,
-                        args=(sql_key, sql, suggestion),
-                        use_container_width=True,
-                    )
+            if suggestions:
+                suggestion_columns = st.columns(min(4, len(suggestions)))
+                for index, suggestion in enumerate(suggestions):
+                    with suggestion_columns[index % len(suggestion_columns)]:
+                        st.button(
+                            suggestion,
+                            key=f"completion_{query_id}_{suggestion_kind}_{index}_{suggestion}",
+                            on_click=apply_suggestion,
+                            args=(sql_key, sql, suggestion),
+                            use_container_width=True,
+                        )
+            else:
+                st.caption("No matching names. Keep typing to refine the search.")
 
         if st.button(
             f"▶  Run Query {query_id}",
