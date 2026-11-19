@@ -1,4 +1,5 @@
 import re
+from html import escape
 
 import streamlit as st
 
@@ -56,15 +57,6 @@ def get_catalog():
         return catalog
     finally:
         con.close()
-
-
-def apply_suggestion(query_key, query_text, suggestion):
-    """Replace the current unfinished token, preserving a trailing semicolon."""
-    suffix_match = re.search(r";?\s*$", query_text)
-    suffix = suffix_match.group(0) if suffix_match else ""
-    prefix = query_text[: suffix_match.start()] if suffix_match else query_text
-    prefix = re.sub(r"[A-Za-z_][A-Za-z0-9_$]*$", "", prefix)
-    st.session_state[query_key] = prefix + suggestion + suffix
 
 
 def get_suggestions(query_text, schema):
@@ -311,18 +303,12 @@ for query_id, query_tab in zip(st.session_state.query_ids, query_tabs):
 
         suggestion_kind, suggestions = get_suggestions(sql, catalog)
         if suggestion_kind:
-            st.caption(f"Suggestions · {suggestion_kind}s · select one to insert")
+            st.caption(f"Suggestions · {suggestion_kind}s")
             if suggestions:
-                suggestion_columns = st.columns(min(4, len(suggestions)))
-                for index, suggestion in enumerate(suggestions):
-                    with suggestion_columns[index % len(suggestion_columns)]:
-                        st.button(
-                            suggestion,
-                            key=f"completion_{query_id}_{suggestion_kind}_{index}_{suggestion}",
-                            on_click=apply_suggestion,
-                            args=(sql_key, sql, suggestion),
-                            use_container_width=True,
-                        )
+                suggestion_chips = " ".join(
+                    f"<code>{escape(suggestion)}</code>" for suggestion in suggestions
+                )
+                st.markdown(suggestion_chips, unsafe_allow_html=True)
             else:
                 st.caption("No matching names. Keep typing to refine the search.")
 

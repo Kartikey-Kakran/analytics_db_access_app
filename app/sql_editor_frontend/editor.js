@@ -13,6 +13,8 @@ const KEYWORDS = new Set((
 
 let currentArgs = {};
 let lastSentValue = null;
+let sendTimer = null;
+let hasUnacknowledgedEdits = false;
 
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (char) => ({
@@ -85,21 +87,30 @@ function handleRender(event) {
   currentArgs = message.args || {};
 
   const incoming = String(currentArgs.value ?? currentArgs.default ?? "");
-  if (textarea.value !== incoming) {
-    const focused = document.activeElement === textarea;
-    const oldStart = textarea.selectionStart;
+  if (lastSentValue !== null && incoming === lastSentValue) {
+    hasUnacknowledgedEdits = false;
+  }
+  const editorIsFocused = document.activeElement === textarea;
+  if (
+    textarea.value !== incoming &&
+    !hasUnacknowledgedEdits &&
+    !editorIsFocused
+  ) {
     textarea.value = incoming;
-    if (focused) {
-      const caret = Math.min(oldStart, incoming.length);
-      textarea.setSelectionRange(caret, caret);
-    }
   }
   editor.style.height = `${Number(currentArgs.height) || 300}px`;
   renderHighlightedSql(textarea.value);
 }
 
 textarea.addEventListener("input", () => {
+  hasUnacknowledgedEdits = true;
   renderHighlightedSql(textarea.value);
+  window.clearTimeout(sendTimer);
+  sendTimer = window.setTimeout(sendValueToStreamlit, 300);
+});
+
+function sendValueToStreamlit() {
+  window.clearTimeout(sendTimer);
   if (textarea.value !== lastSentValue) {
     lastSentValue = textarea.value;
     sendMessage("streamlit:setComponentValue", {
@@ -107,7 +118,10 @@ textarea.addEventListener("input", () => {
       dataType: "json"
     });
   }
-});
+}
+
+// Commit the current SQL as soon as the user leaves the editor.
+textarea.addEventListener("blur", sendValueToStreamlit);
 
 textarea.addEventListener("scroll", () => {
   highlight.scrollTop = textarea.scrollTop;
